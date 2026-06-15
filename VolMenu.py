@@ -11,6 +11,8 @@ Features:
   then plugin(s) to run (or "Run all")
 - Scan queue: after configuring a scan, the user can queue another one;
   all queued scans run sequentially at the end
+- **NEW:** After each scan, an HTML report is generated containing all
+  plugin outputs in a single file with a built‑in search and navigation.
 
 Requires: Windows, Python 3.9+, Volatility 3 (vol.exe via PyInstaller build
 or a vol.py entry point), tkinter (bundled with standard CPython on Windows).
@@ -23,6 +25,7 @@ import subprocess
 import threading
 import time
 import webbrowser
+import html
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -57,14 +60,11 @@ REG_ROOT = winreg.HKEY_CURRENT_USER
 REG_PATH = r"Software\DFIRVault\VolMenu"
 
 VOL_EXE_VALUE = "VolExePath"
-PERF_PARALLELISM_VALUE = "ParallelismEnabled"
-PERF_WORKERS_VALUE = "WorkerCount"
+PERF_PARALLELISM_VALUE = "ParallelismMode"
 PERF_VERBOSE_VALUE = "VerboseOutput"
 PERF_SMARTCACHE_VALUE = "SmartCacheEnabled"
 
 VOLATILITY3_URL = "https://github.com/volatilityfoundation/volatility3"
-
-DEFAULT_WORKERS = os.cpu_count() or 4
 
 # ---------------------------------------------------------------------------
 # Plugin catalogue (Volatility 3 - common plugins per OS)
@@ -396,39 +396,37 @@ def ensure_vol_exe():
 # ---------------------------------------------------------------------------
 # Performance configuration menu
 # ---------------------------------------------------------------------------
+PARALLELISM_MODES = ["off", "processes", "threads"]
+
+
 def show_performance_menu():
     while True:
-        parallelism = reg_get_bool(PERF_PARALLELISM_VALUE, False)
-        workers = reg_get_int(PERF_WORKERS_VALUE, DEFAULT_WORKERS)
+        mode_idx = reg_get_int(PERF_PARALLELISM_VALUE, 0)
+        if mode_idx < 0 or mode_idx >= len(PARALLELISM_MODES):
+            mode_idx = 0
+        mode = PARALLELISM_MODES[mode_idx]
         verbose = reg_get_bool(PERF_VERBOSE_VALUE, False)
         smartcache = reg_get_bool(PERF_SMARTCACHE_VALUE, True)
 
         print("\n" + "=" * 50)
         print(" Performance Configuration")
         print("=" * 50)
-        print(f" 1. Parallelism (-p):        {'ON' if parallelism else 'OFF'}")
-        print(f" 2. Worker count:            {workers}  (CPUs detected: {os.cpu_count()})")
-        print(f" 3. Verbose output (-vvv):   {'ON' if verbose else 'OFF'}")
-        print(f" 4. Smart layer caching:     {'ON' if smartcache else 'OFF'}")
+        print(f" 1. Parallelism (--parallelism): {mode}")
+        print(f" 2. Verbose output (-vvv):       {'ON' if verbose else 'OFF'}")
+        print(f" 3. Smart layer caching:         {'ON' if smartcache else 'OFF'}")
         print(" 0. Back to main menu")
         print("=" * 50)
 
         choice = input("Select an option: ").strip()
 
         if choice == "1":
-            reg_set(PERF_PARALLELISM_VALUE, not parallelism)
-            print(f"Parallelism {'enabled' if not parallelism else 'disabled'}.")
+            next_idx = (mode_idx + 1) % len(PARALLELISM_MODES)
+            reg_set(PERF_PARALLELISM_VALUE, next_idx)
+            print(f"Parallelism set to: {PARALLELISM_MODES[next_idx]}")
         elif choice == "2":
-            raw = input(f"Enter number of workers (1-{os.cpu_count() * 2}): ").strip()
-            if raw.isdigit() and int(raw) > 0:
-                reg_set(PERF_WORKERS_VALUE, int(raw))
-                print(f"Worker count set to {raw}.")
-            else:
-                print("Invalid value.")
-        elif choice == "3":
             reg_set(PERF_VERBOSE_VALUE, not verbose)
             print(f"Verbose output {'enabled' if not verbose else 'disabled'}.")
-        elif choice == "4":
+        elif choice == "3":
             reg_set(PERF_SMARTCACHE_VALUE, not smartcache)
             print(f"Smart layer caching {'enabled' if not smartcache else 'disabled'}.")
         elif choice == "0":
@@ -440,11 +438,14 @@ def show_performance_menu():
 def build_perf_args():
     """Translate stored performance settings into vol.exe CLI args."""
     args = []
-    if reg_get_bool(PERF_PARALLELISM_VALUE, False):
-        # -p/--parallelism takes the number of workers as its argument
-        # (NOT the same as -p/--plugin-dirs).
-        workers = reg_get_int(PERF_WORKERS_VALUE, DEFAULT_WORKERS)
-        args.extend(["-p", str(workers)])
+
+    mode_idx = reg_get_int(PERF_PARALLELISM_VALUE, 0)
+    if 0 <= mode_idx < len(PARALLELISM_MODES):
+        mode = PARALLELISM_MODES[mode_idx]
+        if mode != "off":
+            # --parallelism takes a mode: 'processes' or 'threads'
+            args.extend(["--parallelism", mode])
+
     if reg_get_bool(PERF_VERBOSE_VALUE, False):
         args.append("-vvv")
     if not reg_get_bool(PERF_SMARTCACHE_VALUE, True):
@@ -466,7 +467,322 @@ def find_symbols_dir(vol_exe, target_os):
 
 
 # ---------------------------------------------------------------------------
-# Scan configuration
+# HTML Report Generation (NEW)
+# ---------------------------------------------------------------------------
+def generate_html_report(output_dir, job_info):
+    """
+    Creates an HTML dashboard in output_dir that contains all plugin result
+    .txt files found in that directory. Provides a search box and a
+    collapsible table of contents.
+    """
+    output_path = Path(output_dir)
+    txt_files = sorted(output_path.glob("*.txt"))
+    if not txt_files:
+        print(f"    No .txt result files found in {output_dir} – skipping HTML report.")
+        return
+
+    # Prepare data for HTML
+    sections = []
+    for txt_file in txt_files:
+        # Generate a nice title from the filename
+        stem = txt_file.stem  # e.g. windows_info_Info
+        title = stem.replace("_", " ").title()
+        # Optionally map back to original plugin name (if needed)
+        # Read file content and escape HTML
+        try:
+            content = txt_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            content = f"Error reading file: {e}"
+        sections.append({
+            "id": stem,
+            "title": title,
+            "filename": txt_file.name,
+            "content": content
+        })
+
+    # Build HTML
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Volatility Scan Report</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f0f2f5;
+            color: #1e2a3a;
+            line-height: 1.5;
+        }
+        .container {
+            display: flex;
+            min-height: 100vh;
+        }
+        /* Sidebar (Table of Contents) */
+        .toc {
+            width: 280px;
+            background: #fff;
+            border-right: 1px solid #ddd;
+            position: fixed;
+            height: 100vh;
+            overflow-y: auto;
+            box-shadow: 2px 0 5px rgba(0,0,0,0.05);
+            z-index: 10;
+        }
+        .toc h2 {
+            font-size: 1.2rem;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+            color: #0b5ed7;
+        }
+        .toc ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .toc li {
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .toc a {
+            display: block;
+            padding: 0.6rem 1rem;
+            text-decoration: none;
+            color: #2c3e50;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+        .toc a:hover {
+            background: #e7f1ff;
+            color: #0a58ca;
+            padding-left: 1.2rem;
+        }
+        /* Main content */
+        .content {
+            margin-left: 280px;
+            flex: 1;
+            padding: 2rem;
+            max-width: calc(100% - 280px);
+        }
+        .report-section {
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            margin-bottom: 2rem;
+            overflow: hidden;
+        }
+        .section-header {
+            background: #f8f9fa;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #e9ecef;
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .section-header:hover {
+            background: #e9ecef;
+        }
+        .section-header h2 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #0b5ed7;
+        }
+        .toggle-icon {
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: #6c757d;
+        }
+        .section-content {
+            padding: 1.5rem;
+            overflow-x: auto;
+            display: block;
+        }
+        .section-content.collapsed {
+            display: none;
+        }
+        pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 1rem;
+            border-radius: 6px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin: 0;
+        }
+        .search-container {
+            margin-bottom: 1.5rem;
+            background: #fff;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+        .search-container input {
+            flex: 1;
+            padding: 0.5rem 0.8rem;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+        .search-container button {
+            background: #0b5ed7;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .search-container button:hover {
+            background: #0a58ca;
+        }
+        .highlight {
+            background-color: #ffec99;
+            color: #000;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 2rem;
+            padding: 1rem;
+            color: #6c757d;
+            font-size: 0.8rem;
+        }
+        @media (max-width: 768px) {
+            .toc {
+                width: 100%;
+                position: relative;
+                height: auto;
+                border-right: none;
+                border-bottom: 1px solid #ddd;
+            }
+            .content {
+                margin-left: 0;
+                max-width: 100%;
+                padding: 1rem;
+            }
+            .container {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="toc">
+        <h2>📑 Table of Contents</h2>
+        <ul>
+"""
+    # Build table of contents
+    for sec in sections:
+        html_content += f'            <li><a href="#{sec["id"]}">{html.escape(sec["title"])}</a></li>\n'
+    html_content += """        </ul>
+    </div>
+    <div class="content">
+        <div class="search-container">
+            <input type="text" id="searchInput" placeholder="Search across all reports... (Ctrl+F for browser native)">
+            <button id="searchButton">🔍 Search</button>
+            <button id="clearSearch">✖ Clear</button>
+        </div>
+"""
+    # Generate each section with collapsible content
+    for sec in sections:
+        escaped_content = html.escape(sec["content"])
+        html_content += f"""
+        <div class="report-section" id="{sec['id']}">
+            <div class="section-header" onclick="toggleSection(this)">
+                <h2>{html.escape(sec['title'])}</h2>
+                <span class="toggle-icon">▼</span>
+            </div>
+            <div class="section-content">
+                <pre>{escaped_content}</pre>
+            </div>
+        </div>
+"""
+    html_content += """
+        <div class="footer">
+            Generated by VolMenu • All plugin outputs are embedded.
+        </div>
+    </div>
+</div>
+<script>
+    function toggleSection(header) {
+        const content = header.nextElementSibling;
+        const icon = header.querySelector('.toggle-icon');
+        if (content.classList.contains('collapsed')) {
+            content.classList.remove('collapsed');
+            icon.textContent = '▼';
+        } else {
+            content.classList.add('collapsed');
+            icon.textContent = '▶';
+        }
+    }
+    // Search functionality (simple highlight)
+    function performSearch() {
+        const query = document.getElementById('searchInput').value.trim();
+        if (query === "") {
+            clearHighlights();
+            return;
+        }
+        clearHighlights();
+        const regex = new RegExp(`(${escapeRegex(query)})`, 'gi');
+        const preElements = document.querySelectorAll('.section-content pre');
+        preElements.forEach(pre => {
+            const originalText = pre.innerText;
+            const newHtml = originalText.replace(regex, '<span class="highlight">$1</span>');
+            pre.innerHTML = newHtml;
+        });
+    }
+    function clearHighlights() {
+        const preElements = document.querySelectorAll('.section-content pre');
+        preElements.forEach(pre => {
+            const originalText = pre.innerText;
+            pre.innerHTML = escapeHtml(originalText);
+        });
+    }
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    function escapeRegex(str) {
+        return str.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+    }
+    document.getElementById('searchButton').addEventListener('click', performSearch);
+    document.getElementById('clearSearch').addEventListener('click', () => {
+        document.getElementById('searchInput').value = '';
+        clearHighlights();
+    });
+    document.getElementById('searchInput').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') performSearch();
+    });
+    // Initially all sections are expanded, but we can collapse some if too many? Keep all expanded.
+</script>
+</body>
+</html>
+"""
+
+    report_path = output_path / "volatility_report.html"
+    try:
+        report_path.write_text(html_content, encoding="utf-8")
+        print(f"    HTML report generated: {report_path}")
+    except Exception as e:
+        print(f"    Failed to write HTML report: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Scan configuration and execution (modified)
 # ---------------------------------------------------------------------------
 def select_memory_image():
     print("\nSelect the memory image to analyze.")
@@ -642,7 +958,7 @@ def clean_output_file(out_file):
 
 
 # ---------------------------------------------------------------------------
-# Scan execution
+# Scan execution (modified to generate HTML after each job)
 # ---------------------------------------------------------------------------
 def run_scan_job(vol_exe, job, job_index, total_jobs):
     image_path = os.path.normpath(job["image_path"])
@@ -693,11 +1009,16 @@ def run_scan_job(vol_exe, job, job_index, total_jobs):
             )
             monitor_thread.start()
 
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             with open(out_file, "a", encoding="utf-8", errors="replace") as fh:
                 proc = subprocess.Popen(
                     cmd,
                     stdout=fh,
                     stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=creationflags,
                 )
                 returncode = proc.wait()
 
@@ -713,6 +1034,9 @@ def run_scan_job(vol_exe, job, job_index, total_jobs):
                       f"(see output file)  ({plugin_idx}/{total_plugins} complete)")
         except Exception as exc:
             print(f"    Status: ERROR - Failed to run plugin: {exc}")
+
+    # === NEW: Generate the HTML report for this scan ===
+    generate_html_report(output_dir, job)
 
     print(f"\nScan {job_index}/{total_jobs} complete. Results saved to: {output_dir}")
 
