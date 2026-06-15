@@ -65,9 +65,25 @@ Starts the guided scan workflow:
 1. **Select memory image** — opens a file picker filtered to common memory image extensions (`.raw`, `.mem`, `.dmp`, `.vmem`, `.bin`, `.img`, `.lime`), with an "All files" option.
 2. **Select output directory** — opens a folder picker for where plugin results should be saved.
 3. **Select target OS** — choose Windows, Linux, or Mac. This determines which symbol directory is used and which plugins are available.
-4. **Select plugin(s)** — pick one or more plugins by number (comma-separated), or choose "Run ALL" to run every plugin in the list for that OS.
+4. **Select plugin(s)** — an interactive checkbox-style menu opens:
+   - **Up/Down arrows** (or `W`/`S`) move the highlight
+   - **Space** toggles the highlighted plugin on/off
+   - **A** selects/deselects all plugins
+   - **Enter** confirms your selection (if nothing is checked, the highlighted plugin runs by itself)
+   - **"Run ALL plugins"** row runs every plugin for the selected OS
+   - **Esc** or **C** cancels and returns to the main menu
 
 After configuring a scan, you'll be asked if you want to **queue another scan**. You can repeat this as many times as needed — each scan is added to a queue with its own image, output folder, OS, and plugin selection. Once you decline to add more, VolMenu runs every queued scan in order.
+
+### Cancelling at Any Step
+
+Every step of the New Scan workflow can be cancelled back to the main menu:
+
+- **Memory image / output directory prompts** — type `c` instead of pressing Enter.
+- **Target OS menu** — type `C`.
+- **Plugin checkbox menu** — press `Esc` or `C`.
+
+If you cancel while scans are already queued, you'll be asked whether to discard the queue or run the scans that were already configured.
 
 #### Symbol Directory Detection
 
@@ -94,7 +110,13 @@ saved into the output directory you selected for that scan.
 
 #### Progress Output
 
-While scans run, VolMenu prints live progress for each plugin and each scan:
+While scans run, VolMenu prints live progress for each plugin and each scan. In addition to the per-plugin status lines, VolMenu launches `vol.exe` as a background process and polls its output file every half second. Whenever Volatility writes a line like:
+
+```
+Progress:   45.32		Reading Symbol layer
+```
+
+VolMenu prints the latest percentage and status message to the console, so you can see exactly how far along the current plugin is:
 
 ```
 ############################################################
@@ -107,8 +129,20 @@ While scans run, VolMenu prints live progress for each plugin and each scan:
     Command: C:\Tools\volatility3\vol.exe -f memdump.raw windows.pslist.PsList
     Output -> C:\Output\windows_pslist_PsList.txt
     Status: RUNNING... (this may take a while, please wait)
+    Progress: 0.00% - Scanning primary layer  [plugin 1/3, scan 1/2]
+    Progress: 45.32% - Reading Symbol layer  [plugin 1/3, scan 1/2]
+    Progress: 99.99% - Reading Symbol layer  [plugin 1/3, scan 1/2]
     Status: DONE [OK]  (1/3 complete)
 ```
+
+#### Output File Cleanup
+
+Once a plugin finishes, VolMenu automatically cleans up its output file:
+
+- Every line starting with `Progress` is removed (these are just transient progress updates and clutter the saved report).
+- Runs of multiple consecutive blank lines are collapsed down to a single blank line.
+
+This keeps the saved `.txt` reports clean and focused on the actual plugin output.
 
 ### 2. Configure Performance Settings
 
