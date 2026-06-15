@@ -2,6 +2,8 @@
 
 A lightweight, menu-driven Python wrapper for [Volatility 3](https://github.com/volatilityfoundation/volatility3) on Windows. VolMenu walks you through configuring `vol.exe`, picking memory images and output folders, choosing a target OS, selecting plugins, and queuing multiple scans to run back-to-back — all from a simple console menu.
 
+<img width="650" height="220" alt="image" src="https://github.com/user-attachments/assets/ad52693e-cc6c-4278-b667-9d2ca999cce6" />
+
 ## Features
 
 - **Persistent configuration** — stores the path to `vol.exe` and your performance preferences in `HKCU\Software\DFIRVault\VolMenu`, so you only set it up once.
